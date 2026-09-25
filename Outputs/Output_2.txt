@@ -1,0 +1,189 @@
+import unittest
+import time
+import tracemalloc
+import sys
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives import hashes
+
+# ==========================================
+# TESTABLE ARCHITECTURE COMPONENTS
+# ==========================================
+
+class CloudService:
+    def __init__(self):
+        self.private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        self.public_key = self.private_key.public_key()
+        self.last_temp = None
+        self.last_status = None
+
+    def receive_data(self, encrypted_data):
+        decrypted = self.private_key.decrypt(
+            encrypted_data,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None
+            )
+        )
+        self.last_temp = float(decrypted.decode('utf-8'))
+        self.evaluate_telemetry(self.last_temp)
+        return self.last_status
+
+    def evaluate_telemetry(self, temp):
+        if temp > 8.0 or temp < 0.0:
+            self.last_status = "ALERT"
+        else:
+            self.last_status = "OK"
+
+class EdgeGateway:
+    def __init__(self, cloud_service):
+        self.cloud = cloud_service
+        self.private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        self.public_key = self.private_key.public_key()
+
+    def receive_from_device(self, encrypted_data):
+        decrypted = self.private_key.decrypt(
+            encrypted_data,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None
+            )
+        )
+        # Re-encrypt
+        encrypted_for_cloud = self.cloud.public_key.encrypt(
+            decrypted,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None
+            )
+        )
+        return self.cloud.receive_data(encrypted_for_cloud)
+
+# ==========================================
+# UNIT TESTS (Functional Coverage)
+# ==========================================
+
+class TestMedicalFridgeSystem(unittest.TestCase):
+    
+    def setUp(self):
+        self.cloud = CloudService()
+        self.gateway = EdgeGateway(self.cloud)
+
+    def simulate_device_send(self, temp_value):
+        payload = f"{temp_value:.2f}".encode('utf-8')
+        encrypted_payload = self.gateway.public_key.encrypt(
+            payload,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None
+            )
+        )
+        return self.gateway.receive_from_device(encrypted_payload)
+
+    def test_nominal_temperature(self):
+        """Test that temps between 0 and 8 do not trigger alerts."""
+        status = self.simulate_device_send(5.5)
+        self.assertEqual(status, "OK")
+        self.assertEqual(self.cloud.last_temp, 5.5)
+
+    def test_high_temperature_alert(self):
+        """Test that temps over 8 trigger an alert."""
+        status = self.simulate_device_send(8.1)
+        self.assertEqual(status, "ALERT")
+
+    def test_low_temperature_alert(self):
+        """Test that temps below 0 trigger an alert."""
+        status = self.simulate_device_send(-0.5)
+        self.assertEqual(status, "ALERT")
+
+    def test_end_to_end_decryption_integrity(self):
+        """Test that the payload survives double-encryption intact."""
+        self.simulate_device_send(4.25)
+        self.assertAlmostEqual(self.cloud.last_temp, 4.25)
+
+# ==========================================
+# PERFORMANCE BASELINES
+# ==========================================
+
+def run_performance_baselines():
+    print("\n" + "="*50)
+    print(" CRYPTOGRAPHIC PERFORMANCE BASELINES")
+    print("="*50)
+
+    # 1. Setup
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_key = private_key.public_key()
+    
+    payload_str = "4.25"
+    payload_bytes = payload_str.encode('utf-8')
+    
+    # 2. Payload Bloat Measurement
+    print("\n--- 1. Network / Payload Metrics ---")
+    plaintext_size = sys.getsizeof(payload_bytes)
+    
+    ciphertext = public_key.encrypt(
+        payload_bytes,
+        padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+    )
+    ciphertext_size = sys.getsizeof(ciphertext)
+    
+    print(f"Plaintext Size:  {plaintext_size} bytes")
+    print(f"Ciphertext Size: {ciphertext_size} bytes")
+    print(f"Network Bloat:   {ciphertext_size / plaintext_size:.1f}x increase")
+
+    # 3. Memory Allocation (SRAM usage proxy)
+    print("\n--- 2. Memory Metrics (Arduino SRAM Proxy) ---")
+    tracemalloc.start()
+    _ = public_key.encrypt(
+        payload_bytes,
+        padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+    )
+    current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    print(f"Peak RAM allocated during RSA encryption: {peak} bytes")
+    print("Note: An Arduino Uno has 2,048 bytes of SRAM total.")
+
+    # 4. Latency / CPU Time Measurement
+    print("\n--- 3. Latency Metrics ---")
+    
+    # Measure Encryption
+    enc_times = []
+    for _ in range(100):
+        start_time = time.perf_counter()
+        _ = public_key.encrypt(
+            payload_bytes,
+            padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+        )
+        enc_times.append((time.perf_counter() - start_time) * 1000)
+    
+    avg_enc_time = sum(enc_times) / len(enc_times)
+    
+    # Measure Decryption
+    dec_times = []
+    for _ in range(100):
+        start_time = time.perf_counter()
+        _ = private_key.decrypt(
+            ciphertext,
+            padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+        )
+        dec_times.append((time.perf_counter() - start_time) * 1000)
+        
+    avg_dec_time = sum(dec_times) / len(dec_times)
+
+    print(f"Average Encryption Time (Python): {avg_enc_time:.4f} ms")
+    print(f"Average Decryption Time (Python): {avg_dec_time:.4f} ms")
+    print("\nHardware Translation Rule:")
+    print("A 16MHz Arduino is ~100,000x to 500,000x slower at cryptographic math than this CPU.")
+    print(f"Expected Arduino Encrypt Time: ~{avg_enc_time * 200000 / 1000:.1f} seconds")
+    print("="*50 + "\n")
+
+if __name__ == "__main__":
+    # Run Baselines First
+    run_performance_baselines()
+    
+    # Run Unit Tests Second
+    print("Running Functional Tests...")
+    unittest.main(verbosity=2)
