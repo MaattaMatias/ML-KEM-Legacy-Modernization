@@ -109,7 +109,7 @@ class LegacyDevice(threading.Thread):
             self.gateway.receive_from_device(encrypted_payload)
             
             # Poll every 3 seconds
-            time.sleep(3)
+            time.sleep(10)
 
 if __name__ == "__main__":
     # Boot the infrastructure
