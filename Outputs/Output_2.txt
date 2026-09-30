@@ -1,3 +1,15 @@
+Prompt: Generate baseline tests and measurements for the simlated device. It should be clear how much the chosen cryptographic algorithm affects the performance of the program. Choose baseline measurements that are relevant for this type of system. Arduino has restrictions on hardware. Therefore, hardware metrics and latency could be useful measurements. The measurements should indicate how future updates to the system impact how it works. Create tests that test all parts of the program.  
+
+
+Output:
+
+To establish a baseline for how RSA encryption impacts your resource-constrained simulated device, we must isolate the cryptographic operations from the network logic.
+
+The following suite uses Python's unittest for functional validation across all tiers, and a dedicated Benchmarking tool using time and tracemalloc to measure latency, payload bloat, and memory allocation—the three most critical constraints on an Arduino (which typically only has 2KB to 8KB of SRAM and a 16MHz clock).
+
+Test & Baseline Measurement Suite
+Save this as test_simulation.py and run it. It contains modified, testable versions of the architecture alongside the benchmarking logic.
+
 import unittest
 import time
 import tracemalloc
@@ -187,3 +199,13 @@ if __name__ == "__main__":
     # Run Unit Tests Second
     print("Running Functional Tests...")
     unittest.main(verbosity=2)
+
+
+How to use these baselines for future updates
+When testing new algorithms (e.g., swapping RSA for Elliptic Curve Cryptography (ECC) or AES), compare the new outputs against these baseline categories:
+
+Network Bloat: RSA-2048 bloats a 4-byte temperature reading to over 256 bytes. If you switch to AES-128, track how much the payload size shrinks. This directly dictates how long the Arduino's radio (e.g., WiFi/LoRa) must stay powered on.
+
+Peak RAM Allocation: The script measures dynamic memory allocation during the encrypt() operation. If this number exceeds ~1500 bytes, a physical 8-bit Arduino will likely crash with a Stack Overflow, necessitating a shift to a 32-bit device (like an ESP32) or a lighter algorithm.
+
+Encryption Latency: While measured in milliseconds on Python, asymmetric cryptography involves heavy prime factorization. The baseline calculates a multiplier for a 16MHz chip. If you update the system to use symmetric AES instead, this baseline will prove that the latency drops exponentially, freeing up CPU cycles for sensor reading.

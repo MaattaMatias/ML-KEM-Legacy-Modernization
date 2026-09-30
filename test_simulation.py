@@ -1,30 +1,38 @@
 import unittest
 import time
 import tracemalloc
-import sys
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
-from cryptography.hazmat.primitives import hashes
+import os
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import oqs
 
 # ==========================================
 # TESTABLE ARCHITECTURE COMPONENTS
 # ==========================================
 
+DEVICE_PSK = b'\x01' * 32  # Simulated 256-bit PSK for local edge network
+
 class CloudService:
     def __init__(self):
-        self.private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        self.public_key = self.private_key.public_key()
+        self.kem = oqs.KeyEncapsulation("ML-KEM-1024")
+        self.public_key = self.kem.generate_keypair()
+        self.private_key = self.kem.export_secret_key()
         self.last_temp = None
         self.last_status = None
 
-    def receive_data(self, encrypted_data):
-        decrypted = self.private_key.decrypt(
-            encrypted_data,
-            padding.OAEP(
-                mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                algorithm=hashes.SHA256(),
-                label=None
-            )
-        )
+    def receive_data(self, payload):
+        encapsulated_key = payload['encapsulated_key']
+        nonce = payload['nonce']
+        ciphertext = payload['ciphertext']
+
+        # Decapsulate ML-KEM secret
+        kem_decaps = oqs.KeyEncapsulation("ML-KEM-1024")
+        kem_decaps.secret_key = self.private_key
+        shared_secret = kem_decaps.decap_secret(encapsulated_key)
+
+        # Decrypt payload using AES-256
+        aesgcm = AESGCM(shared_secret)
+        decrypted = aesgcm.decrypt(nonce, ciphertext, None)
+        
         self.last_temp = float(decrypted.decode('utf-8'))
         self.evaluate_telemetry(self.last_temp)
         return self.last_status
@@ -38,28 +46,29 @@ class CloudService:
 class EdgeGateway:
     def __init__(self, cloud_service):
         self.cloud = cloud_service
-        self.private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        self.public_key = self.private_key.public_key()
+        self.device_aes = AESGCM(DEVICE_PSK)
 
-    def receive_from_device(self, encrypted_data):
-        decrypted = self.private_key.decrypt(
-            encrypted_data,
-            padding.OAEP(
-                mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                algorithm=hashes.SHA256(),
-                label=None
-            )
-        )
-        # Re-encrypt
-        encrypted_for_cloud = self.cloud.public_key.encrypt(
-            decrypted,
-            padding.OAEP(
-                mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                algorithm=hashes.SHA256(),
-                label=None
-            )
-        )
-        return self.cloud.receive_data(encrypted_for_cloud)
+    def receive_from_device(self, payload):
+        # 1. Decrypt local device traffic
+        nonce = payload['nonce']
+        ciphertext = payload['ciphertext']
+        decrypted_temp = self.device_aes.decrypt(nonce, ciphertext, None)
+
+        # 2. Encapsulate key for Cloud WAN using ML-KEM-1024
+        kem_encaps = oqs.KeyEncapsulation("ML-KEM-1024")
+        encapsulated_key, shared_secret = kem_encaps.encap_secret(self.cloud.public_key)
+
+        # 3. Encrypt for WAN
+        cloud_aes = AESGCM(shared_secret)
+        cloud_nonce = os.urandom(12)
+        cloud_ciphertext = cloud_aes.encrypt(cloud_nonce, decrypted_temp, None)
+
+        cloud_payload = {
+            'encapsulated_key': encapsulated_key,
+            'nonce': cloud_nonce,
+            'ciphertext': cloud_ciphertext
+        }
+        return self.cloud.receive_data(cloud_payload)
 
 # ==========================================
 # UNIT TESTS (Functional Coverage)
@@ -70,37 +79,32 @@ class TestMedicalFridgeSystem(unittest.TestCase):
     def setUp(self):
         self.cloud = CloudService()
         self.gateway = EdgeGateway(self.cloud)
+        self.device_aes = AESGCM(DEVICE_PSK)
 
     def simulate_device_send(self, temp_value):
-        payload = f"{temp_value:.2f}".encode('utf-8')
-        encrypted_payload = self.gateway.public_key.encrypt(
-            payload,
-            padding.OAEP(
-                mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                algorithm=hashes.SHA256(),
-                label=None
-            )
-        )
-        return self.gateway.receive_from_device(encrypted_payload)
+        payload_bytes = f"{temp_value:.2f}".encode('utf-8')
+        nonce = os.urandom(12)
+        ciphertext = self.device_aes.encrypt(nonce, payload_bytes, None)
+        
+        return self.gateway.receive_from_device({
+            'nonce': nonce,
+            'ciphertext': ciphertext
+        })
 
     def test_nominal_temperature(self):
-        """Test that temps between 0 and 8 do not trigger alerts."""
         status = self.simulate_device_send(5.5)
         self.assertEqual(status, "OK")
         self.assertEqual(self.cloud.last_temp, 5.5)
 
     def test_high_temperature_alert(self):
-        """Test that temps over 8 trigger an alert."""
         status = self.simulate_device_send(8.1)
         self.assertEqual(status, "ALERT")
 
     def test_low_temperature_alert(self):
-        """Test that temps below 0 trigger an alert."""
         status = self.simulate_device_send(-0.5)
         self.assertEqual(status, "ALERT")
 
     def test_end_to_end_decryption_integrity(self):
-        """Test that the payload survives double-encryption intact."""
         self.simulate_device_send(4.25)
         self.assertAlmostEqual(self.cloud.last_temp, 4.25)
 
@@ -109,76 +113,95 @@ class TestMedicalFridgeSystem(unittest.TestCase):
 # ==========================================
 
 def run_performance_baselines():
-    print("\n" + "="*50)
-    print(" CRYPTOGRAPHIC PERFORMANCE BASELINES")
-    print("="*50)
+    print("\n" + "="*70)
+    print(" CRYPTOGRAPHIC PERFORMANCE BASELINES: DEVICE & GATEWAY")
+    print("="*70)
 
-    # 1. Setup
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    public_key = private_key.public_key()
-    
+    # ---------------------------------------------------------
+    # PART 1: DEVICE (AES-256) Metrics (Replacing RSA)
+    # ---------------------------------------------------------
+    print("\n[PART 1: Legacy Device using AES-256]")
+    aesgcm = AESGCM(DEVICE_PSK)
     payload_str = "4.25"
     payload_bytes = payload_str.encode('utf-8')
     
-    # 2. Payload Bloat Measurement
+    raw_plaintext_len = len(payload_bytes)
+    nonce = os.urandom(12)
+    ciphertext = aesgcm.encrypt(nonce, payload_bytes, None)
+    raw_packet_len = len(nonce) + len(ciphertext)
+    
     print("\n--- 1. Network / Payload Metrics ---")
-    plaintext_size = sys.getsizeof(payload_bytes)
-    
-    ciphertext = public_key.encrypt(
-        payload_bytes,
-        padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
-    )
-    ciphertext_size = sys.getsizeof(ciphertext)
-    
-    print(f"Plaintext Size:  {plaintext_size} bytes")
-    print(f"Ciphertext Size: {ciphertext_size} bytes")
-    print(f"Network Bloat:   {ciphertext_size / plaintext_size:.1f}x increase")
+    print(f"Plaintext Size:  {raw_plaintext_len} bytes")
+    print(f"Packet Size:     {raw_packet_len} bytes")
+    print(f"Network Bloat:   {raw_packet_len / raw_plaintext_len:.1f}x increase (RSA-2048 was ~64.0x)")
 
-    # 3. Memory Allocation (SRAM usage proxy)
     print("\n--- 2. Memory Metrics (Arduino SRAM Proxy) ---")
     tracemalloc.start()
-    _ = public_key.encrypt(
-        payload_bytes,
-        padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
-    )
-    current, peak = tracemalloc.get_traced_memory()
+    _ = aesgcm.encrypt(nonce, payload_bytes, None)
+    _, peak_aes = tracemalloc.get_traced_memory()
     tracemalloc.stop()
-    print(f"Peak RAM allocated during RSA encryption: {peak} bytes")
-    print("Note: An Arduino Uno has 2,048 bytes of SRAM total.")
+    print(f"Peak RAM allocated: {peak_aes} bytes")
 
-    # 4. Latency / CPU Time Measurement
     print("\n--- 3. Latency Metrics ---")
-    
-    # Measure Encryption
     enc_times = []
-    for _ in range(100):
+    for _ in range(1000):
         start_time = time.perf_counter()
-        _ = public_key.encrypt(
-            payload_bytes,
-            padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
-        )
+        _ = aesgcm.encrypt(nonce, payload_bytes, None)
         enc_times.append((time.perf_counter() - start_time) * 1000)
-    
     avg_enc_time = sum(enc_times) / len(enc_times)
+    print(f"Average Encrypt Time (Python): {avg_enc_time:.6f} ms")
+
+
+    # ---------------------------------------------------------
+    # PART 2: GATEWAY (ML-KEM-1024) Metrics 
+    # ---------------------------------------------------------
+    print("\n\n[PART 2: Edge Gateway using ML-KEM-1024 (FIPS 203)]")
+    kem_server = oqs.KeyEncapsulation("ML-KEM-1024")
+    public_key = kem_server.generate_keypair()
+    private_key = kem_server.export_secret_key()
+    kem_client = oqs.KeyEncapsulation("ML-KEM-1024")
     
-    # Measure Decryption
-    dec_times = []
+    print("\n--- 1. Network / Payload Metrics (WAN Link) ---")
+    ct_kem, shared_secret = kem_client.encap_secret(public_key)
+    
+    print(f"Public Key Size (Cloud -> Gateway): {len(public_key)} bytes")
+    print(f"Ciphertext Size (Gateway -> Cloud): {len(ct_kem)} bytes")
+    print(f"Negotiated Shared Secret:           {len(shared_secret)} bytes")
+
+    print("\n--- 2. Memory Metrics (Gateway RAM Proxy) ---")
+    tracemalloc.start()
+    _, _ = kem_client.encap_secret(public_key)
+    _, peak_encap = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    
+    kem_server_decaps = oqs.KeyEncapsulation("ML-KEM-1024")
+    kem_server_decaps.secret_key = private_key
+    tracemalloc.start()
+    _ = kem_server_decaps.decap_secret(ct_kem)
+    _, peak_decap = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    print(f"Peak RAM for Encapsulation (Gateway): {peak_encap} bytes")
+    print(f"Peak RAM for Decapsulation (Cloud):   {peak_decap} bytes")
+
+    print("\n--- 3. Latency Metrics ---")
+    encap_times = []
     for _ in range(100):
         start_time = time.perf_counter()
-        _ = private_key.decrypt(
-            ciphertext,
-            padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
-        )
-        dec_times.append((time.perf_counter() - start_time) * 1000)
-        
-    avg_dec_time = sum(dec_times) / len(dec_times)
+        kem_client.encap_secret(public_key)
+        encap_times.append((time.perf_counter() - start_time) * 1000)
+    avg_encap_time = sum(encap_times) / len(encap_times)
+    
+    decap_times = []
+    for _ in range(100):
+        start_time = time.perf_counter()
+        kem_server_decaps.decap_secret(ct_kem)
+        decap_times.append((time.perf_counter() - start_time) * 1000)
+    avg_decap_time = sum(decap_times) / len(decap_times)
 
-    print(f"Average Encryption Time (Python): {avg_enc_time:.4f} ms")
-    print(f"Average Decryption Time (Python): {avg_dec_time:.4f} ms")
-    print("\nHardware Translation Rule:")
-    print("A 16MHz Arduino is ~100,000x to 500,000x slower at cryptographic math than this CPU.")
-    print(f"Expected Arduino Encrypt Time: ~{avg_enc_time * 200000 / 1000:.1f} seconds")
-    print("="*50 + "\n")
+    print(f"Average Encapsulation Time (Gateway): {avg_encap_time:.4f} ms")
+    print(f"Average Decapsulation Time (Cloud):   {avg_decap_time:.4f} ms")
+    print("="*70 + "\n")
 
 if __name__ == "__main__":
     # Run Baselines First

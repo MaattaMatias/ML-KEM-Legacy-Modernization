@@ -1,0 +1,34 @@
+=================================================================
+ CRYPTOGRAPHIC PERFORMANCE BASELINES (AES-256 vs Legacy RSA)
+=================================================================
+
+--- 1. Network / Payload Metrics ---
+Plaintext Size:  4 bytes
+Packet Size (AES-GCM): 32 bytes
+Network Bloat:   8.0x increase (Down from 64.0x with RSA-2048)
+
+--- 2. Memory Metrics (Arduino SRAM Proxy) ---
+Peak RAM allocated during AES encryption: 53 bytes
+Note: Much safer for an Arduino Uno's 2,048-byte limit compared to RSA.
+
+--- 3. Latency Metrics ---
+Average Encryption Time (Python AES): 0.001116 ms
+
+Hardware Translation Rule:
+A 16MHz Arduino handles AES in a few milliseconds (orders of magnitude faster than RSA).
+=================================================================
+
+Running Functional Tests...
+test_end_to_end_decryption_integrity (__main__.TestMedicalFridgeSystem.test_end_to_end_decryption_integrity)
+Test that the payload survives AES decryption + ML-KEM encapsulation + WAN encryption. ... ok
+test_high_temperature_alert (__main__.TestMedicalFridgeSystem.test_high_temperature_alert)
+Test that temps over 8 trigger an alert. ... ok
+test_low_temperature_alert (__main__.TestMedicalFridgeSystem.test_low_temperature_alert)
+Test that temps below 0 trigger an alert. ... ok
+test_nominal_temperature (__main__.TestMedicalFridgeSystem.test_nominal_temperature)
+Test that temps between 0 and 8 do not trigger alerts. ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.005s
+
+OK

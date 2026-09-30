@@ -1,3 +1,5 @@
+Prompt: Simulate an Arduino-based legacy device to monitor and control the temperature of a fridge. The system should consist of a simulated legacy device, an edge gateway, and a cloud service.  The system uses RSA as an encryption algorithm. The simulated device can be a python script. The system should send a notification if the temperature goes above +8 celsius or below 0 celsius. The fridge contains valuable medicine, which is why temperature control and encryption are important. 
+
 This simulation models a three-tier IoT architecture (Device → Edge Gateway → Cloud) using thread-based asynchronous communication. It strictly enforces RSA asymmetric encryption at each network boundary to protect the sensor payloads.
 
 Architectural Assumptions

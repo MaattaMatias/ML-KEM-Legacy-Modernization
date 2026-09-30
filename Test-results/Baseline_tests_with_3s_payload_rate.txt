@@ -1,0 +1,36 @@
+==================================================
+ CRYPTOGRAPHIC PERFORMANCE BASELINES
+==================================================
+
+--- 1. Network / Payload Metrics ---
+Plaintext Size:  37 bytes
+Ciphertext Size: 289 bytes
+Network Bloat:   7.8x increase
+
+--- 2. Memory Metrics (Arduino SRAM Proxy) ---
+Peak RAM allocated during RSA encryption: 1545 bytes
+Note: An Arduino Uno has 2,048 bytes of SRAM total.
+
+--- 3. Latency Metrics ---
+Average Encryption Time (Python): 0.0362 ms
+Average Decryption Time (Python): 0.7380 ms
+
+Hardware Translation Rule:
+A 16MHz Arduino is ~100,000x to 500,000x slower at cryptographic math than this CPU.
+Expected Arduino Encrypt Time: ~7.2 seconds
+==================================================
+
+Running Functional Tests...
+test_end_to_end_decryption_integrity (__main__.TestMedicalFridgeSystem.test_end_to_end_decryption_integrity)
+Test that the payload survives double-encryption intact. ... ok
+test_high_temperature_alert (__main__.TestMedicalFridgeSystem.test_high_temperature_alert)
+Test that temps over 8 trigger an alert. ... ok
+test_low_temperature_alert (__main__.TestMedicalFridgeSystem.test_low_temperature_alert)
+Test that temps below 0 trigger an alert. ... ok
+test_nominal_temperature (__main__.TestMedicalFridgeSystem.test_nominal_temperature)
+Test that temps between 0 and 8 do not trigger alerts. ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.283s
+
+OK

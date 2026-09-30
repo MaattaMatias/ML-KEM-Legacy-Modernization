@@ -1,0 +1,44 @@
+======================================================================
+ CRYPTOGRAPHIC PERFORMANCE BASELINES: DEVICE & GATEWAY
+======================================================================
+
+[PART 1: Legacy Device using AES-256]
+
+--- 1. Network / Payload Metrics ---
+Plaintext Size:  4 bytes
+Packet Size:     32 bytes
+Network Bloat:   8.0x increase (RSA-2048 was ~64.0x)
+
+--- 2. Memory Metrics (Arduino SRAM Proxy) ---
+Peak RAM allocated: 53 bytes
+
+--- 3. Latency Metrics ---
+Average Encrypt Time (Python): 0.000880 ms
+
+
+[PART 2: Edge Gateway using ML-KEM-1024 (FIPS 203)]
+
+--- 1. Network / Payload Metrics (WAN Link) ---
+Public Key Size (Cloud -> Gateway): 1568 bytes
+Ciphertext Size (Gateway -> Cloud): 1568 bytes
+Negotiated Shared Secret:           32 bytes
+
+--- 2. Memory Metrics (Gateway RAM Proxy) ---
+Peak RAM for Encapsulation (Gateway): 5218 bytes
+Peak RAM for Decapsulation (Cloud):   2736 bytes
+
+--- 3. Latency Metrics ---
+Average Encapsulation Time (Gateway): 0.0431 ms
+Average Decapsulation Time (Cloud):   0.0497 ms
+======================================================================
+
+Running Functional Tests...
+test_end_to_end_decryption_integrity (__main__.TestMedicalFridgeSystem.test_end_to_end_decryption_integrity) ... ok
+test_high_temperature_alert (__main__.TestMedicalFridgeSystem.test_high_temperature_alert) ... ok
+test_low_temperature_alert (__main__.TestMedicalFridgeSystem.test_low_temperature_alert) ... ok
+test_nominal_temperature (__main__.TestMedicalFridgeSystem.test_nominal_temperature) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.002s
+
+OK
