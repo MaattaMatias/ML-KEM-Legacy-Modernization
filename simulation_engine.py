@@ -2,99 +2,143 @@ import os
 import time
 import random
 import threading
+import logging
+import requests
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request, Response
+from pydantic import BaseModel
+from pythonjsonlogger import jsonlogger
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-import oqs  # Open Quantum Safe Python Wrapper
+import oqs
 
-# ---------------------------------------------------------
-# Pre-Shared Key (PSK) for the local Legacy Device Network
-# 32 bytes = 256-bit key for AES-256. 
-# In physical deployment, this is burned into the Arduino.
-# ---------------------------------------------------------
-DEVICE_PSK = b'\x01' * 32 
+# ==========================================
+# 1. CLOUD SERVICE (FastAPI Tier)
+# ==========================================
 
-class CloudService:
-    """
-    Tier 3: The Cloud Backend.
-    Uses ML-KEM-1024 (Kyber) for Post-Quantum secure key exchange.
-    """
-    def __init__(self):
-        # Generate ML-KEM-1024 Keypair
-        self.kem = oqs.KeyEncapsulation("ML-KEM-1024")
-        self.public_key = self.kem.generate_keypair()
-        self.private_key = self.kem.export_secret_key()
-        print("[CLOUD] Initialized. Post-Quantum ML-KEM-1024 Keypair generated.")
+# --- Logging & Metrics Setup ---
+logger = logging.getLogger("cloud-service")
+logger.setLevel(logging.INFO)
+logHandler = logging.StreamHandler()
+logHandler.setFormatter(jsonlogger.JsonFormatter('%(asctime)s %(levelname)s %(name)s %(message)s'))
+logger.addHandler(logHandler)
 
-    def receive_data(self, payload):
-        # Unpack the hybrid KEM payload
-        encapsulated_key = payload['encapsulated_key']
-        nonce = payload['nonce']
-        ciphertext = payload['ciphertext']
+REQUEST_COUNT = Counter('http_requests_total', 'HTTP Requests', ['method', 'endpoint', 'status'])
+TELEMETRY_ALERTS = Counter('telemetry_alerts_total', 'Total critical threshold breaches')
 
-        # 1. Decapsulate the shared secret using ML-KEM-1024 private key
+# --- Post-Quantum Key Generation ---
+kem = oqs.KeyEncapsulation("ML-KEM-1024")
+CLOUD_PUBLIC_KEY = kem.generate_keypair()
+CLOUD_PRIVATE_KEY = kem.export_secret_key()
+
+app = FastAPI(title="Cloud IoT Service")
+
+class TelemetryPayload(BaseModel):
+    encapsulated_key: str
+    nonce: str
+    ciphertext: str
+
+@app.get("/healthz")
+def healthz():
+    return {"status": "alive"}
+
+@app.get("/metrics")
+def get_metrics():
+    """Scraped by Prometheus (and tested by GitHub Actions)."""
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+@app.get("/public-key")
+def get_public_key():
+    """Endpoint for Gateways to download the public key on boot."""
+    return {"public_key": CLOUD_PUBLIC_KEY.hex()}
+
+@app.post("/telemetry")
+def receive_telemetry(payload: TelemetryPayload):
+    try:
+        encap_key = bytes.fromhex(payload.encapsulated_key)
+        nonce = bytes.fromhex(payload.nonce)
+        ciphertext = bytes.fromhex(payload.ciphertext)
+
+        # 1. Decapsulate ML-KEM secret
         kem_decaps = oqs.KeyEncapsulation("ML-KEM-1024")
-        kem_decaps.secret_key = self.private_key
-        shared_secret = kem_decaps.decap_secret(encapsulated_key)
+        kem_decaps.secret_key = CLOUD_PRIVATE_KEY
+        shared_secret = kem_decaps.decap_secret(encap_key)
 
-        # 2. Decrypt the telemetry using AES-256-GCM keyed by the shared secret
-        # ML-KEM-1024 outputs a 32-byte secret, perfectly sized for AES-256
+        # 2. Decrypt AES-256 payload
         aesgcm = AESGCM(shared_secret)
         decrypted = aesgcm.decrypt(nonce, ciphertext, None)
-        
         temp = float(decrypted.decode('utf-8'))
-        self.evaluate_telemetry(temp)
 
-    def evaluate_telemetry(self, temp):
-        # Alerting Logic: Medicine must remain between 0C and +8C
+        # 3. Evaluate Thresholds
         if temp > 8.0 or temp < 0.0:
-            print(f"\n[CLOUD ALERT] 🔴 CRITICAL THRESHOLD BREACH: {temp:.2f}°C")
-            print("[CLOUD ALERT] Dispatching emergency notification to facility manager.\n")
+            TELEMETRY_ALERTS.inc()
+            logger.warning("🔴 CRITICAL THRESHOLD BREACH", extra={"temperature": temp, "status": "ALERT"})
         else:
-            print(f"[CLOUD INFO] 🟢 Telemetry nominal: {temp:.2f}°C")
+            logger.info("🟢 Telemetry nominal", extra={"temperature": temp, "status": "OK"})
+
+        return {"status": "success"}
+    except Exception as e:
+        logger.error("Decryption failed", extra={"error": str(e)})
+        raise HTTPException(status_code=400, detail="Decryption failed")
+
+def run_cloud_server():
+    """Runs the FastAPI server in a background thread."""
+    # We suppress uvicorn logs to let our JSON logger stand out
+    uvicorn.run(app, host="127.0.0.1", port=8080, log_config=None)
+
+
+# ==========================================
+# 2. EDGE GATEWAY (Tier 2)
+# ==========================================
+
+DEVICE_PSK = b'\x01' * 32  # 256-bit PSK for local Device -> Gateway network
 
 class EdgeGateway:
-    """
-    Tier 2: Local Edge Gateway.
-    Bridging the local AES network to the Post-Quantum WAN.
-    """
-    def __init__(self, cloud_service):
-        self.cloud = cloud_service
-        # Initialize symmetric AES for the local network
+    def __init__(self, cloud_url="http://127.0.0.1:8080"):
+        self.cloud_url = cloud_url
         self.device_aes = AESGCM(DEVICE_PSK)
-        print("[GATEWAY] Initialized. AES-256 Pre-Shared Key loaded. Connected to Cloud.")
+        
+        print("[GATEWAY] Booting. Fetching Cloud's ML-KEM Public Key via HTTP...")
+        # Fetch the Cloud's Public Key over HTTP
+        response = requests.get(f"{self.cloud_url}/public-key")
+        self.cloud_public_key = bytes.fromhex(response.json()["public_key"])
+        print("[GATEWAY] ML-KEM Public Key successfully retrieved. Ready to route traffic.")
 
     def receive_from_device(self, payload):
-        # 1. Decrypt local payload using AES-256-GCM
-        nonce = payload['nonce']
-        ciphertext = payload['ciphertext']
-        
-        decrypted_temp = self.device_aes.decrypt(nonce, ciphertext, None)
-        temp_str = decrypted_temp.decode('utf-8')
-        print(f"[GATEWAY] Decrypted local payload: {temp_str}°C. Securing for WAN via ML-KEM 1024...")
+        # 1. Decrypt AES-256 local traffic
+        decrypted_temp = self.device_aes.decrypt(payload['nonce'], payload['ciphertext'], None)
+        print(f"\n[GATEWAY] Received {decrypted_temp.decode('utf-8')}°C from device. Securing for WAN...")
 
-        # 2. Post-Quantum Hybrid Encryption for WAN
-        # Generate a shared secret and encapsulate it against the Cloud's public key
+        # 2. Hybrid Quantum-Safe Encapsulation & Encryption
         kem_encaps = oqs.KeyEncapsulation("ML-KEM-1024")
-        encapsulated_key, shared_secret = kem_encaps.encap_secret(self.cloud.public_key)
+        encapsulated_key, shared_secret = kem_encaps.encap_secret(self.cloud_public_key)
 
-        # Encrypt the telemetry using the dynamically negotiated shared secret
         cloud_aes = AESGCM(shared_secret)
-        cloud_nonce = os.urandom(12) # GCM requires a 12-byte nonce
+        cloud_nonce = os.urandom(12)
         cloud_ciphertext = cloud_aes.encrypt(cloud_nonce, decrypted_temp, None)
 
-        # 3. Forward to Cloud
+        # 3. HTTP POST to Cloud Service
         cloud_payload = {
-            'encapsulated_key': encapsulated_key,
-            'nonce': cloud_nonce,
-            'ciphertext': cloud_ciphertext
+            "encapsulated_key": encapsulated_key.hex(),
+            "nonce": cloud_nonce.hex(),
+            "ciphertext": cloud_ciphertext.hex()
         }
-        self.cloud.receive_data(cloud_payload)
+        
+        try:
+            res = requests.post(f"{self.cloud_url}/telemetry", json=cloud_payload)
+            if res.status_code == 200:
+                print(f"[GATEWAY] Successfully routed payload to Cloud Service via HTTP POST.")
+            else:
+                print(f"[GATEWAY] ERROR: Cloud returned {res.status_code}")
+        except requests.exceptions.ConnectionError:
+            print("[GATEWAY] ERROR: Failed to connect to Cloud Service.")
 
+
+# ==========================================
+# 3. LEGACY DEVICE (Tier 1)
+# ==========================================
 
 class LegacyDevice(threading.Thread):
-    """
-    Tier 1: Simulated Arduino Sensor.
-    Stripped of RSA. Now relies on highly efficient AES-256.
-    """
     def __init__(self, gateway):
         super().__init__()
         self.gateway = gateway
@@ -102,21 +146,18 @@ class LegacyDevice(threading.Thread):
         self.aesgcm = AESGCM(DEVICE_PSK)
 
     def run(self):
-        print("[DEVICE] Booting simulated legacy sensor with AES-256...\n")
+        print("[DEVICE] Simulated Arduino booting. PSK loaded. Starting telemetry loop...")
         while self.running:
             if random.random() > 0.85:
-                temp = random.uniform(-2.0, 11.0) # Simulate anomaly
+                temp = random.uniform(-2.0, 11.0) # Anomaly
             else:
-                temp = random.uniform(2.0, 6.0)   # Simulate nominal
+                temp = random.uniform(2.0, 6.0)   # Nominal
 
             payload_bytes = f"{temp:.2f}".encode('utf-8')
-
-            # Encrypt payload using Symmetric AES-256
             nonce = os.urandom(12)
             ciphertext = self.aesgcm.encrypt(nonce, payload_bytes, None)
-
-            print(f"[DEVICE] Read {temp:.2f}°C. AES-256 payload generated. Transmitting...")
             
+            # Send to local gateway via simulated local network (function call)
             self.gateway.receive_from_device({
                 'nonce': nonce,
                 'ciphertext': ciphertext
@@ -124,10 +165,33 @@ class LegacyDevice(threading.Thread):
             
             time.sleep(10)
 
+
+# ==========================================
+# ORCHESTRATION SCRIPT
+# ==========================================
+
 if __name__ == "__main__":
-    cloud = CloudService()
-    gateway = EdgeGateway(cloud)
-    
+    # 1. Start the Cloud Service API in a daemon thread
+    cloud_thread = threading.Thread(target=run_cloud_server, daemon=True)
+    cloud_thread.start()
+
+    # Wait for FastAPI to bind to the port
+    print("[SYSTEM] Waiting for FastAPI Cloud Service to boot...")
+    for _ in range(10):
+        try:
+            if requests.get("http://127.0.0.1:8080/healthz").status_code == 200:
+                print("[SYSTEM] Cloud Service API is Online.\n")
+                break
+        except requests.exceptions.ConnectionError:
+            time.sleep(0.5)
+    else:
+        print("[SYSTEM] Failed to boot Cloud Service. Exiting.")
+        exit(1)
+
+    # 2. Initialize the Edge Gateway
+    gateway = EdgeGateway("http://127.0.0.1:8080")
+
+    # 3. Start the Device Simulator
     device = LegacyDevice(gateway)
     device.start()
 
@@ -135,6 +199,6 @@ if __name__ == "__main__":
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\nShutting down simulation...")
+        print("\n[SYSTEM] Shutting down simulation...")
         device.running = False
         device.join()

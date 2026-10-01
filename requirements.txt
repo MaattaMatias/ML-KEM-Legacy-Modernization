@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+requests
+cryptography
+liboqs-python
+prometheus-client
+python-json-logger
+pytest
+httpx
