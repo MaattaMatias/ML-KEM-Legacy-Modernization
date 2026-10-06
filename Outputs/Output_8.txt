@@ -1,0 +1,294 @@
+prompt: The programming language to use is python and the tool is the free version of github actions
+
+Output:
+
+To transition your architecture from a local simulation script to a production-ready cloud service, we need to convert the Cloud Service into a proper web API.
+
+This setup uses FastAPI (the Python standard for modern, fast APIs), instruments it with Prometheus metrics and Structured JSON Logging, and packages it using a multi-stage Docker build. Finally, a GitHub Actions workflow handles the Continuous Integration (CI) and simulated Continuous Deployment (CD).
+
+Here are the complete files you need to automate your infrastructure.
+
+1. The Cloud Service API & Metrics (app.py)
+This converts the previous cloud logic into an HTTP microservice. It exposes endpoints for telemetry, liveness (/healthz), readiness (/ready), and Prometheus metrics (/metrics).
+
+import os
+import time
+import logging
+from fastapi import FastAPI, HTTPException, Response, Request
+from pydantic import BaseModel
+from pythonjsonlogger import jsonlogger
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import oqs
+
+# --- Structured JSON Logging ---
+logger = logging.getLogger("medical-fridge-cloud")
+logger.setLevel(logging.INFO)
+logHandler = logging.StreamHandler()
+formatter = jsonlogger.JsonFormatter('%(asctime)s %(levelname)s %(name)s %(message)s')
+logHandler.setFormatter(formatter)
+logger.addHandler(logHandler)
+
+# --- Prometheus Metrics (RED Metrics) ---
+REQUEST_COUNT = Counter('http_requests_total', 'HTTP Requests', ['method', 'endpoint', 'status'])
+REQUEST_LATENCY = Histogram('http_request_duration_seconds', 'Request latency', ['method', 'endpoint'])
+TELEMETRY_ALERTS = Counter('telemetry_alerts_total', 'Total critical threshold breaches')
+
+# --- Post-Quantum Crypto Initialization ---
+kem = oqs.KeyEncapsulation("ML-KEM-1024")
+PUBLIC_KEY = kem.generate_keypair()
+PRIVATE_KEY = kem.export_secret_key()
+
+app = FastAPI(title="Medical Fridge Cloud Service")
+
+class TelemetryPayload(BaseModel):
+    encapsulated_key: str # Hex encoded for JSON transport
+    nonce: str            # Hex encoded
+    ciphertext: str       # Hex encoded
+
+@app.middleware("http")
+async def monitor_requests(request: Request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    duration = time.time() - start_time
+    
+    # Exclude health checks from metrics noise
+    if request.url.path not in ["/healthz", "/ready", "/metrics"]:
+        REQUEST_COUNT.labels(request.method, request.url.path, response.status_code).inc()
+        REQUEST_LATENCY.labels(request.method, request.url.path).observe(duration)
+        
+    return response
+
+# --- Health Checks ---
+@app.get("/healthz")
+def liveness_probe():
+    """Confirms process is running (used to restart deadlocked containers)."""
+    return {"status": "alive"}
+
+@app.get("/ready")
+def readiness_probe():
+    """Confirms crypto libraries are loaded and ready to accept traffic."""
+    try:
+        _ = oqs.KeyEncapsulation("ML-KEM-1024")
+        return {"status": "ready"}
+    except Exception as e:
+        logger.error("Readiness check failed", extra={"error": str(e)})
+        raise HTTPException(status_code=503, detail="Crypto Subsystem Unavailable")
+
+@app.get("/metrics")
+def get_metrics():
+    """Scraped by Prometheus."""
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+@app.get("/public-key")
+def get_public_key():
+    """Edge gateway fetches this on boot to encapsulate the WAN shared secret."""
+    return {"public_key": PUBLIC_KEY.hex()}
+
+# --- Core Business Logic ---
+@app.post("/telemetry")
+def receive_telemetry(payload: TelemetryPayload):
+    try:
+        encap_key = bytes.fromhex(payload.encapsulated_key)
+        nonce = bytes.fromhex(payload.nonce)
+        ciphertext = bytes.fromhex(payload.ciphertext)
+
+        # 1. Decapsulate ML-KEM secret using Cloud's Private Key
+        kem_decaps = oqs.KeyEncapsulation("ML-KEM-1024")
+        kem_decaps.secret_key = PRIVATE_KEY
+        shared_secret = kem_decaps.decaps_secret(encap_key)
+
+        # 2. Decrypt AES-256-GCM payload
+        aesgcm = AESGCM(shared_secret)
+        decrypted = aesgcm.decrypt(nonce, ciphertext, None)
+        temp = float(decrypted.decode('utf-8'))
+
+        # 3. Evaluate Thresholds (0C to 8C)
+        if temp > 8.0 or temp < 0.0:
+            TELEMETRY_ALERTS.inc()
+            logger.warning("CRITICAL THRESHOLD BREACH", extra={"temperature": temp, "status": "ALERT"})
+        else:
+            logger.info("Telemetry nominal", extra={"temperature": temp, "status": "OK"})
+
+        return {"status": "success"}
+
+    except Exception as e:
+        logger.error("Failed to process telemetry", extra={"error": str(e)})
+        raise HTTPException(status_code=400, detail="Decryption failed")
+
+2. Dependencies & Dockerfile
+liboqs-python requires C build tools (CMake, gcc) to compile the underlying quantum-safe libraries. We use a multi-stage Dockerfile to compile them, ensuring the final production image remains tiny and secure.
+
+requirements.txt
+
+fastapi
+uvicorn
+cryptography
+liboqs-python
+prometheus-client
+python-json-logger
+pytest
+httpx
+
+Dockerfile
+# Stage 1: Build C dependencies
+FROM python:3.11-slim as builder
+
+RUN apt-get update && apt-get install -y \
+    build-essential cmake ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY requirements.txt .
+
+# This triggers the automatic download and compilation of the liboqs C library
+RUN pip wheel --no-cache-dir --no-deps --wheel-dir /app/wheels -r requirements.txt
+
+# Stage 2: Minimal Production Image
+FROM python:3.11-slim
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y libssl-dev curl && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/wheels /wheels
+COPY --from=builder /app/requirements.txt .
+RUN pip install --no-cache /wheels/*
+
+COPY app.py .
+COPY tests/ tests/
+
+EXPOSE 8080
+
+# Production ASGI server
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
+
+3. Pytest Automated Tests (tests/test_api.py)
+This runs in the CI pipeline to catch regressions before deployment.
+import os
+import oqs
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from fastapi.testclient import TestClient
+from app import app, PUBLIC_KEY
+
+client = TestClient(app)
+
+def test_health_probes():
+    assert client.get("/healthz").status_code == 200
+    assert client.get("/ready").status_code == 200
+
+def test_metrics_endpoint():
+    response = client.get("/metrics")
+    assert response.status_code == 200
+    assert b"telemetry_alerts_total" in response.content
+
+def test_secure_telemetry_flow():
+    # 1. Gateway encapsulates against cloud public key
+    kem_client = oqs.KeyEncapsulation("ML-KEM-1024")
+    encapsulated_key, shared_secret = kem_client.encap_secret(PUBLIC_KEY)
+    
+    # 2. Gateway encrypts temperature payload
+    aesgcm = AESGCM(shared_secret)
+    nonce = os.urandom(12)
+    ciphertext = aesgcm.encrypt(nonce, b"5.5", None)
+    
+    # 3. Simulate Gateway transmitting to Cloud
+    response = client.post("/telemetry", json={
+        "encapsulated_key": encapsulated_key.hex(),
+        "nonce": nonce.hex(),
+        "ciphertext": ciphertext.hex()
+    })
+    
+    assert response.status_code == 200
+    assert response.json() == {"status": "success"}
+
+4. GitHub Actions CI/CD Pipeline
+Save this as .github/workflows/ci-cd.yml.
+
+Because you are using the free tier, this pipeline builds the Docker image, spins up a temporary Test Environment right inside the GitHub Runner, executes the smoke/health checks against it, and (if successful) pushes the validated image to the GitHub Container Registry (GHCR) ready for production deployment.
+name: Secure Fridge Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-test-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python Environment
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+          cache: 'pip'
+
+      # The GitHub Runner requires CMake to build the Quantum-Safe dependencies
+      - name: Install System Build Dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential ninja-build
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install flake8
+
+      - name: Run Code Linter (Flake8)
+        run: |
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+
+      - name: Run Unit & Integration Tests (Pytest)
+        run: pytest tests/
+
+      - name: Build Docker Container
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true # Loads into the local docker daemon for the test environment
+          tags: secure-fridge:test
+
+      # --- AUTOMATED DEPLOYMENT TO TEST ENVIRONMENT ---
+      - name: Deploy to Local Test Environment
+        run: |
+          echo "Spinning up containerized test environment..."
+          docker run -d --name test-fridge-cloud -p 8080:8080 secure-fridge:test
+          # Allow Uvicorn to boot up
+          sleep 3
+
+      - name: Execute Health & Metric Smoke Tests
+        run: |
+          echo "Validating Liveness Probe..."
+          curl -f http://localhost:8080/healthz
+          
+          echo "Validating Crypto Readiness Probe..."
+          curl -f http://localhost:8080/ready
+          
+          echo "Validating Prometheus Metric Export..."
+          curl -s http://localhost:8080/metrics | grep "telemetry_alerts_total"
+
+      # --- PUSH VALIDATED ARTIFACT (Runs on Merge to Main) ---
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push Verified Container to Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker tag secure-fridge:test ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+

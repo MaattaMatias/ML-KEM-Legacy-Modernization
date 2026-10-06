@@ -1,0 +1,222 @@
+Prompt: Create a test for measuring ML-KEM performance. Integrate it into test_simulation.py and keep it comparable to the original tests that were used to measure the RSA performance with the simulated device
+
+Output:
+
+Here is the fully integrated test_simulation.py.
+
+This version combines the architectural components, the functional unittest coverage, and a unified benchmarking suite that runs measurements for both the Device (AES-256) and the Gateway (ML-KEM-1024). It maps these directly to the same three metrics you used to establish your baseline for the legacy RSA system: Payload Bloat, Memory Allocation, and CPU Latency.
+
+Save this as test_simulation.py and run it to see the complete end-to-end performance and functional tests.
+
+import unittest
+import time
+import tracemalloc
+import os
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import oqs
+
+# ==========================================
+# TESTABLE ARCHITECTURE COMPONENTS
+# ==========================================
+
+DEVICE_PSK = b'\x01' * 32  # Simulated 256-bit PSK for local edge network
+
+class CloudService:
+    def __init__(self):
+        self.kem = oqs.KeyEncapsulation("ML-KEM-1024")
+        self.public_key = self.kem.generate_keypair()
+        self.private_key = self.kem.export_secret_key()
+        self.last_temp = None
+        self.last_status = None
+
+    def receive_data(self, payload):
+        encapsulated_key = payload['encapsulated_key']
+        nonce = payload['nonce']
+        ciphertext = payload['ciphertext']
+
+        # Decapsulate ML-KEM secret
+        kem_decaps = oqs.KeyEncapsulation("ML-KEM-1024")
+        kem_decaps.secret_key = self.private_key
+        shared_secret = kem_decaps.decaps_secret(encapsulated_key)
+
+        # Decrypt payload using AES-256
+        aesgcm = AESGCM(shared_secret)
+        decrypted = aesgcm.decrypt(nonce, ciphertext, None)
+        
+        self.last_temp = float(decrypted.decode('utf-8'))
+        self.evaluate_telemetry(self.last_temp)
+        return self.last_status
+
+    def evaluate_telemetry(self, temp):
+        if temp > 8.0 or temp < 0.0:
+            self.last_status = "ALERT"
+        else:
+            self.last_status = "OK"
+
+class EdgeGateway:
+    def __init__(self, cloud_service):
+        self.cloud = cloud_service
+        self.device_aes = AESGCM(DEVICE_PSK)
+
+    def receive_from_device(self, payload):
+        # 1. Decrypt local device traffic
+        nonce = payload['nonce']
+        ciphertext = payload['ciphertext']
+        decrypted_temp = self.device_aes.decrypt(nonce, ciphertext, None)
+
+        # 2. Encapsulate key for Cloud WAN using ML-KEM-1024
+        kem_encaps = oqs.KeyEncapsulation("ML-KEM-1024")
+        encapsulated_key, shared_secret = kem_encaps.encap_secret(self.cloud.public_key)
+
+        # 3. Encrypt for WAN
+        cloud_aes = AESGCM(shared_secret)
+        cloud_nonce = os.urandom(12)
+        cloud_ciphertext = cloud_aes.encrypt(cloud_nonce, decrypted_temp, None)
+
+        cloud_payload = {
+            'encapsulated_key': encapsulated_key,
+            'nonce': cloud_nonce,
+            'ciphertext': cloud_ciphertext
+        }
+        return self.cloud.receive_data(cloud_payload)
+
+# ==========================================
+# UNIT TESTS (Functional Coverage)
+# ==========================================
+
+class TestMedicalFridgeSystem(unittest.TestCase):
+    
+    def setUp(self):
+        self.cloud = CloudService()
+        self.gateway = EdgeGateway(self.cloud)
+        self.device_aes = AESGCM(DEVICE_PSK)
+
+    def simulate_device_send(self, temp_value):
+        payload_bytes = f"{temp_value:.2f}".encode('utf-8')
+        nonce = os.urandom(12)
+        ciphertext = self.device_aes.encrypt(nonce, payload_bytes, None)
+        
+        return self.gateway.receive_from_device({
+            'nonce': nonce,
+            'ciphertext': ciphertext
+        })
+
+    def test_nominal_temperature(self):
+        status = self.simulate_device_send(5.5)
+        self.assertEqual(status, "OK")
+        self.assertEqual(self.cloud.last_temp, 5.5)
+
+    def test_high_temperature_alert(self):
+        status = self.simulate_device_send(8.1)
+        self.assertEqual(status, "ALERT")
+
+    def test_low_temperature_alert(self):
+        status = self.simulate_device_send(-0.5)
+        self.assertEqual(status, "ALERT")
+
+    def test_end_to_end_decryption_integrity(self):
+        self.simulate_device_send(4.25)
+        self.assertAlmostEqual(self.cloud.last_temp, 4.25)
+
+# ==========================================
+# PERFORMANCE BASELINES
+# ==========================================
+
+def run_performance_baselines():
+    print("\n" + "="*70)
+    print(" CRYPTOGRAPHIC PERFORMANCE BASELINES: DEVICE & GATEWAY")
+    print("="*70)
+
+    # ---------------------------------------------------------
+    # PART 1: DEVICE (AES-256) Metrics (Replacing RSA)
+    # ---------------------------------------------------------
+    print("\n[PART 1: Legacy Device using AES-256]")
+    aesgcm = AESGCM(DEVICE_PSK)
+    payload_str = "4.25"
+    payload_bytes = payload_str.encode('utf-8')
+    
+    raw_plaintext_len = len(payload_bytes)
+    nonce = os.urandom(12)
+    ciphertext = aesgcm.encrypt(nonce, payload_bytes, None)
+    raw_packet_len = len(nonce) + len(ciphertext)
+    
+    print("\n--- 1. Network / Payload Metrics ---")
+    print(f"Plaintext Size:  {raw_plaintext_len} bytes")
+    print(f"Packet Size:     {raw_packet_len} bytes")
+    print(f"Network Bloat:   {raw_packet_len / raw_plaintext_len:.1f}x increase (RSA-2048 was ~64.0x)")
+
+    print("\n--- 2. Memory Metrics (Arduino SRAM Proxy) ---")
+    tracemalloc.start()
+    _ = aesgcm.encrypt(nonce, payload_bytes, None)
+    _, peak_aes = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    print(f"Peak RAM allocated: {peak_aes} bytes")
+
+    print("\n--- 3. Latency Metrics ---")
+    enc_times = []
+    for _ in range(1000):
+        start_time = time.perf_counter()
+        _ = aesgcm.encrypt(nonce, payload_bytes, None)
+        enc_times.append((time.perf_counter() - start_time) * 1000)
+    avg_enc_time = sum(enc_times) / len(enc_times)
+    print(f"Average Encrypt Time (Python): {avg_enc_time:.6f} ms")
+
+
+    # ---------------------------------------------------------
+    # PART 2: GATEWAY (ML-KEM-1024) Metrics 
+    # ---------------------------------------------------------
+    print("\n\n[PART 2: Edge Gateway using ML-KEM-1024 (FIPS 203)]")
+    kem_server = oqs.KeyEncapsulation("ML-KEM-1024")
+    public_key = kem_server.generate_keypair()
+    private_key = kem_server.export_secret_key()
+    kem_client = oqs.KeyEncapsulation("ML-KEM-1024")
+    
+    print("\n--- 1. Network / Payload Metrics (WAN Link) ---")
+    ct_kem, shared_secret = kem_client.encap_secret(public_key)
+    
+    print(f"Public Key Size (Cloud -> Gateway): {len(public_key)} bytes")
+    print(f"Ciphertext Size (Gateway -> Cloud): {len(ct_kem)} bytes")
+    print(f"Negotiated Shared Secret:           {len(shared_secret)} bytes")
+
+    print("\n--- 2. Memory Metrics (Gateway RAM Proxy) ---")
+    tracemalloc.start()
+    _, _ = kem_client.encap_secret(public_key)
+    _, peak_encap = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    
+    kem_server_decaps = oqs.KeyEncapsulation("ML-KEM-1024")
+    kem_server_decaps.secret_key = private_key
+    tracemalloc.start()
+    _ = kem_server_decaps.decaps_secret(ct_kem)
+    _, peak_decap = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    print(f"Peak RAM for Encapsulation (Gateway): {peak_encap} bytes")
+    print(f"Peak RAM for Decapsulation (Cloud):   {peak_decap} bytes")
+
+    print("\n--- 3. Latency Metrics ---")
+    encap_times = []
+    for _ in range(100):
+        start_time = time.perf_counter()
+        kem_client.encap_secret(public_key)
+        encap_times.append((time.perf_counter() - start_time) * 1000)
+    avg_encap_time = sum(encap_times) / len(encap_times)
+    
+    decap_times = []
+    for _ in range(100):
+        start_time = time.perf_counter()
+        kem_server_decaps.decaps_secret(ct_kem)
+        decap_times.append((time.perf_counter() - start_time) * 1000)
+    avg_decap_time = sum(decap_times) / len(decap_times)
+
+    print(f"Average Encapsulation Time (Gateway): {avg_encap_time:.4f} ms")
+    print(f"Average Decapsulation Time (Cloud):   {avg_decap_time:.4f} ms")
+    print("="*70 + "\n")
+
+if __name__ == "__main__":
+    # Run Baselines First
+    run_performance_baselines()
+    
+    # Run Unit Tests Second
+    print("Running Functional Tests...")
+    unittest.main(verbosity=2)
