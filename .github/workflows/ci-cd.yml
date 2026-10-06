@@ -1,4 +1,4 @@
-name: Secure Fridge Pipeline
+name: ML-KEM Pipeline
 
 on:
   push:
@@ -29,7 +29,7 @@ jobs:
 
       # The GitHub Runner requires CMake to build the Quantum-Safe dependencies
       - name: Install System Build Dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake build-essential ninja-build
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential ninja-build git libssl-dev
 
       - name: Install Python Dependencies
         run: |
@@ -48,16 +48,26 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: dockerfile
           load: true # Loads into the local docker daemon for the test environment
-          tags: secure-fridge:test
+          tags: "ml-kem:test"
 
       # --- AUTOMATED DEPLOYMENT TO TEST ENVIRONMENT ---
       - name: Deploy to Local Test Environment
         run: |
           echo "Spinning up containerized test environment..."
-          docker run -d --name test-fridge-cloud -p 8080:8080 secure-fridge:test
-          # Allow Uvicorn to boot up
-          sleep 3
+          docker run -d --name test-ml-kem-cloud -p 8080:8080 ml-kem:test
+          # Wait until Uvicorn is actually serving (import/boot can take a few seconds)
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8080/healthz; then
+              echo "Cloud service is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Container failed to become healthy"
+          docker logs test-ml-kem-cloud
+          exit 1
 
       - name: Execute Health & Metric Smoke Tests
         run: |
@@ -82,5 +92,7 @@ jobs:
       - name: Push Verified Container to Registry
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
-          docker tag secure-fridge:test ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          # GHCR requires fully lowercase image names
+          IMAGE="${REGISTRY}/$(echo "${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]'):${GITHUB_SHA}"
+          docker tag ml-kem:test "$IMAGE"
+          docker push "$IMAGE"
