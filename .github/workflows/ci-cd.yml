@@ -41,8 +41,18 @@ jobs:
         run: |
           flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
 
-      - name: Run Unit & Integration Tests (Pytest)
-        run: pytest tests/
+      - name: Debug environment
+run: |
+pwd
+ls -la
+find . -name "simulation_engine.py"
+python --version
+python -c "import os; print(os.getcwd())"
+python -c "import sys; print(sys.path)"
+python -c "import simulation_engine; print(simulation_engine.__file__)"
+ 
+- name: Run Unit & Integration Tests (Pytest)
+run: python -m pytest tests/ -v
 
       - name: Build Docker Container
         uses: docker/build-push-action@v5
