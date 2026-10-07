@@ -1,105 +1,105 @@
 name: ML-KEM Pipeline
- 
+
 on:
-push:
-branches: [ "main" ]
-pull_request:
-branches: [ "main" ]
- 
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
 env:
-REGISTRY: ghcr.io
-IMAGE_NAME: ${{ github.repository }}
- 
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
 jobs:
-build-test-deploy:
-runs-on: ubuntu-latest
-permissions:
-contents: read
-packages: write
- 
-steps:
-- name: Checkout Source Code
-uses: actions/checkout@v4
- 
-- name: Set up Python Environment
-uses: actions/setup-python@v4
-with:
-python-version: "3.11"
-cache: 'pip'
- 
-- name: Install System Build Dependencies
-run: sudo apt-get update && sudo apt-get install -y cmake build-essential ninja-build git libssl-dev
- 
-- name: Install Python Dependencies
-run: |
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-pip install flake8
- 
-- name: Run Code Linter (Flake8)
-run: |
-flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
- 
-- name: Debug environment
-run: |
-pwd
-ls -la
-find . -name "simulation_engine.py"
-python --version
-python -c "import os; print(os.getcwd())"
-python -c "import sys; print(sys.path)"
-python -c "import simulation_engine; print(simulation_engine.__file__)"
- 
-- name: Run Unit & Integration Tests (Pytest)
-run: python -m pytest tests/ -v
- 
-- name: Build Docker Container
-uses: docker/build-push-action@v5
-with:
-context: .
-file: dockerfile
-load: true
-tags: "ml-kem:test"
- 
-- name: Deploy to Local Test Environment
-run: |
-echo "Spinning up containerized test environment..."
-docker run -d --name test-ml-kem-cloud -p 8080:8080 ml-kem:test
- 
-for i in $(seq 1 30); do
-if curl -fsS http://localhost:8080/healthz; then
-echo "Cloud service is up"
-exit 0
-fi
-sleep 2
-done
- 
-echo "Container failed to become healthy"
-docker logs test-ml-kem-cloud
-exit 1
- 
-- name: Execute Health & Metric Smoke Tests
-run: |
-echo "Validating Liveness Probe..."
-curl -f http://localhost:8080/healthz
- 
-echo "Validating Crypto Readiness Probe..."
-curl -f http://localhost:8080/ready
- 
-echo "Validating Prometheus Metric Export..."
-curl -s http://localhost:8080/metrics | grep "telemetry_alerts_total"
- 
-- name: Log in to GitHub Container Registry
-if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-uses: docker/login-action@v3
-with:
-registry: ${{ env.REGISTRY }}
-username: ${{ github.actor }}
-password: ${{ secrets.GITHUB_TOKEN }}
- 
-- name: Push Verified Container to Registry
-if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-run: |
-IMAGE="${REGISTRY}/$(echo "${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]'):${GITHUB_SHA}"
-docker tag ml-kem:test "$IMAGE"
-docker push "$IMAGE"
+  build-test-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python Environment
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+          cache: 'pip'
+
+      - name: Install System Build Dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential ninja-build git libssl-dev
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install flake8
+
+      - name: Run Code Linter (Flake8)
+        run: |
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+
+      - name: Debug environment
+        run: |
+          pwd
+          ls -la
+          find . -name "simulation_engine.py"
+          python --version
+          python -c "import os; print(os.getcwd())"
+          python -c "import sys; print(sys.path)"
+          python -c "import simulation_engine; print(simulation_engine.__file__)"
+
+      - name: Run Unit & Integration Tests (Pytest)
+        run: python -m pytest tests/ -v
+
+      - name: Build Docker Container
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: dockerfile
+          load: true
+          tags: "ml-kem:test"
+
+      - name: Deploy to Local Test Environment
+        run: |
+          echo "Spinning up containerized test environment..."
+          docker run -d --name test-ml-kem-cloud -p 8080:8080 ml-kem:test
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8080/healthz; then
+              echo "Cloud service is up"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "Container failed to become healthy"
+          docker logs test-ml-kem-cloud
+          exit 1
+
+      - name: Execute Health & Metric Smoke Tests
+        run: |
+          echo "Validating Liveness Probe..."
+          curl -f http://localhost:8080/healthz
+
+          echo "Validating Crypto Readiness Probe..."
+          curl -f http://localhost:8080/ready
+
+          echo "Validating Prometheus Metric Export..."
+          curl -s http://localhost:8080/metrics | grep "telemetry_alerts_total"
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push Verified Container to Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          IMAGE="${REGISTRY}/$(echo "${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]'):${GITHUB_SHA}"
+          docker tag ml-kem:test "$IMAGE"
+          docker push "$IMAGE"
