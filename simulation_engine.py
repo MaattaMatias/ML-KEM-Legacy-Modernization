@@ -42,6 +42,16 @@ class TelemetryPayload(BaseModel):
 def healthz():
     return {"status": "alive"}
 
+@app.get("/ready")
+def readiness_probe():
+    """Confirms crypto libraries are loaded and ready to accept traffic."""
+    try:
+        _ = oqs.KeyEncapsulation("ML-KEM-1024")
+        return {"status": "ready"}
+    except Exception as e:
+        logger.error("Readiness check failed", extra={"error": str(e)})
+        raise HTTPException(status_code=503, detail="Crypto Subsystem Unavailable")
+
 @app.get("/metrics")
 def get_metrics():
     """Scraped by Prometheus (and tested by GitHub Actions)."""

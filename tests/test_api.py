@@ -14,6 +14,12 @@ def test_health_probe():
     assert response.status_code == 200
     assert response.json() == {"status": "alive"}
 
+def test_readiness_probe():
+    """Test that the crypto readiness probe responds successfully."""
+    response = client.get("/ready")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready"}
+
 def test_public_key_endpoint():
     """Test that the Gateway can fetch the Post-Quantum public key."""
     response = client.get("/public-key")
